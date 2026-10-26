@@ -79,7 +79,7 @@ on:
         required: false
         type: string
       build_time:
-        description: "自定义构建时间 (可选，N或留空=当前UTC)"
+        description: "自定义构建时间 (可选，N或留空=当前UTC+3h)"
         required: false
         type: string
         default: "Sun Dec 01 08:10:00 UTC 2024"
@@ -133,6 +133,8 @@ jobs:
       android_version: ${{ steps.resolve.outputs.android_version }}
       sub_level: ${{ steps.resolve.outputs.sub_level }}
       kernel_full: ${{ steps.resolve.outputs.kernel_full }}
+      build_time: ${{ steps.resolve.outputs.build_time }}
+
     steps:
       - name: 检出版本数据
         uses: actions/checkout@v7
@@ -142,11 +144,13 @@ jobs:
         env:
           KERNEL_VERSION: ${{ inputs.kernel_version }}
           OS_PATCH_LEVEL: ${{ inputs.os_patch_level }}
+          BUILD_TIME: ${{ inputs.build_time }}
         run: |
           python3 <<'PY'
           import json
           import os
           import sys
+          from datetime import datetime, timedelta, timezone
           from pathlib import Path
 
           kernel_version = os.environ["KERNEL_VERSION"]
@@ -177,60 +181,4 @@ jobs:
               if not kernel_full:
                   print(f"::error::{android_version} / {kernel_version} 缺少 LTS 版本数据")
                   sys.exit(1)
-              sub_level = "X"
-          else:
-              matched = next(
-                  (entry for entry in data.get("entries", []) if entry.get("date") == os_patch_level),
-                  None,
-              )
-              if matched is None:
-                  print(f"::error::未找到 {android_version} / {kernel_version} / {os_patch_level} 对应的版本数据")
-                  sys.exit(1)
-              kernel_full = matched.get("kernel", "")
-              prefix = f"{kernel_version}."
-              if not kernel_full.startswith(prefix):
-                  print(f"::error::版本数据异常: {kernel_full} 不属于 {kernel_version}")
-                  sys.exit(1)
-              sub_level = kernel_full.rsplit(".", 1)[-1]
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"android_version={android_version}\n")
-              output.write(f"sub_level={sub_level}\n")
-              output.write(f"kernel_full={kernel_full}\n")
-
-          print(f"解析结果: {android_version} / {kernel_full}，子版本号: {sub_level}")
-          PY
-
-  build-custom-kernel:
-    name: "${{ needs.resolve-version.outputs.kernel_full }}-${{ needs.resolve-version.outputs.android_version }}-${{ inputs.os_patch_level }}"
-    needs: resolve-version
-    uses: ./.github/workflows/build.yml
-    secrets: inherit
-    with:
-      android_version: ${{ needs.resolve-version.outputs.android_version }}
-      kernel_version: ${{ inputs.kernel_version }}
-      sub_level: ${{ needs.resolve-version.outputs.sub_level }}
-      os_patch_level: ${{ inputs.os_patch_level }}
-      revision: "r1"
-      ksu_variant: ${{ inputs.kernelsu_variant }}
-      version: ${{ inputs.version || '' }}
-      build_time: ${{ inputs.build_time || '' }}
-      use_zram: ${{ inputs.use_zram }}
-      use_bbg: ${{ inputs.use_bbg }}
-      use_kpm: ${{ inputs.use_kpm }}
-      use_rekernel: ${{ inputs.use_rekernel || false }}
-      use_nomount: ${{ inputs.use_nomount || false }}
-      use_networking: ${{ inputs.use_networking || false }}
-      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
-      supp_op: ${{ inputs.supp_op || false }}
-      enable_susfs: ${{ inputs.ksu_mode != '禁用SUSFS' && inputs.ksu_mode != '禁用KSU' }}
-      ksu_mode: ${{ inputs.ksu_mode || '关闭' }}
-      droidspaces: ${{ inputs.droidspaces || 'off' }}
-      droidspaces_ntsync: ${{ inputs.droidspaces_ntsync || false }}
-      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
-
-  get-ksu-manager:
-    uses: ./.github/workflows/get-manager.yml
-    secrets: inherit
-    with:
-      kernelsu_variant: ${{ inputs.kernelsu_variant }}
+              sub_level = "
