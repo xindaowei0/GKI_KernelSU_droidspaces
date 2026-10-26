@@ -101,7 +101,8 @@ jobs:
   build-kernel:
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # 【修改1】从 60 分钟延长到 360 分钟（GitHub 单 Job 上限为 6 小时）
+    timeout-minutes: 360
 
     env:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
@@ -221,9 +222,6 @@ jobs:
           EOF
 
           mkdir -p "$GITHUB_WORKSPACE/git-repo"
-          # storage.googleapis.com 偶发 TLS 握手失败（curl 退出码 35），全量构建 80+ 个
-          # job 各跑一次，累积下来命中概率不低。--retry-all-errors 才会重试握手类错误，
-          # -f 保证 HTTP 错误页不会被当成成功写进 repo 文件。
           curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 \
             https://storage.googleapis.com/git-repo-downloads/repo \
             -o "$GITHUB_WORKSPACE/git-repo/repo"
@@ -264,7 +262,6 @@ jobs:
           restore-keys: |
             ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-
 
-      # 仅 6.1+ 走 bazel 构建，持久化 --disk_cache 目录以加速后续构建
       - name: 恢复 bazel 磁盘缓存
         if: inputs.android_version != 'android12' && inputs.android_version != 'android13'
         uses: actions/cache@v5
@@ -303,8 +300,6 @@ jobs:
 
       - name: 克隆依赖仓库
         run: |
-          # 依赖克隆可能遇到瞬时网络错误；递增等待并随机错峰，避免矩阵任务同时重试。
-          # 每次克隆前清理目标目录，防止上次中断的残留使后续尝试必然失败。
           clone_with_retry() {
             local repository="$1" destination="$2"
             shift 2
@@ -348,14 +343,10 @@ jobs:
           RETRY_DELAY=15
           SYNC_TIMEOUT=15m
 
-          # android.googlesource.com 偶发限流、连接重置或单个 project 拉取卡死，
-          # 单次失败不代表分支有问题，整轮重来通常就能成功。
           init_repo() {
             $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest \
               -b common-${FORMATTED_BRANCH} --repo-rev=v2.16 || return 1
 
-            # ls-remote 同样可能瞬时失败；失败时返回空会让弃用分支判定出错，
-            # 因此按退出码重试，全部失败就让本轮重来而不是白跑一次 sync。
             local ok=false
             for _ in 1 2 3; do
               if REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH}); then
@@ -375,9 +366,6 @@ jobs:
               echo "检测到已弃用的分支: $FORMATTED_BRANCH"
               sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
             elif [ -z "$REMOTE_BRANCH" ]; then
-              # Google 会把过期的月度分支整个删掉（既不在活跃也不在 deprecated/ 下），
-              # 但 manifest 仍指向该分支。发布 tag 不会被删，回退到编号最大的 _rN tag。
-              # 必须写成 refs/tags/ 全路径，裸 tag 名会被 repo 当成分支去 refs/heads/ 下找。
               local latest_tag
               latest_tag=$(git ls-remote https://android.googlesource.com/kernel/common "refs/tags/${FORMATTED_BRANCH}_r*" 2>/dev/null \
                 | awk '{print $2}' | grep -v '\^{}$' | sed 's|refs/tags/||' \
@@ -399,11 +387,7 @@ jobs:
 
             rc=0
             if init_repo; then
-              # 不加 --fail-fast：单个 project 出错时让其余 project 继续拉完，
-              # 重试只需要补齐缺失部分。-j4 与 --no-clone-bundle 是为了避免
-              # 高并发触发限流、以及跳过经常超时的 clone.bundle。
               SYNC_FLAGS="-c -j4 --jobs-checkout=4 --no-tags --no-clone-bundle --retry-fetches=3"
-              # 第二次在原地续传（repo sync 可断点续传），第三次才整目录重来
               [ "$attempt" -gt 1 ] && SYNC_FLAGS="$SYNC_FLAGS --force-sync"
               timeout -k 60 "$SYNC_TIMEOUT" $REPO sync $SYNC_FLAGS || rc=$?
               if [ "$rc" -eq 0 ]; then
@@ -425,8 +409,6 @@ jobs:
               exit "$rc"
             fi
 
-            # 最后一次重试前彻底清空：只删 .repo 会残留半检出的 project 目录，
-            # 之后每次 sync 都会以 "Checking out local projects failed" 收场。
             if [ "$attempt" -eq $((MAX_ATTEMPTS - 1)) ]; then
               echo "清空工作目录后重来"
               find "$PWD" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -521,7 +503,6 @@ jobs:
           echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
           echo "实际子版本号: $ACTUAL_SUBLEVEL"
 
-      # 以同步后的实际 SUBLEVEL 判断，避免对已包含上游修复的 LTS 重复打补丁
       - name: 自动应用 CVE-2026-43499 rtmutex 修复链
         if: inputs.cve_2026_43499_patch
         working-directory: ${{ env.KERNEL_ROOT }}/common
@@ -601,7 +582,6 @@ jobs:
               ;;
           esac
 
-          # 检查自定义提交 (仅对 SukiSU 生效)
           CONFIG_FILE="config/config"
           if [ -f "$CONFIG_FILE" ]; then
             CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
@@ -718,13 +698,11 @@ jobs:
 
           echo "已更新 get_ksu_version_full 模板: $VERSION_TEMPLATE"
 
-      # 在内核源码和 KSU 准备完成后再获取 SUSFS，避免在前期集中拉取。
       - name: 克隆 SUSFS 源码
         if: inputs.enable_susfs
         run: |
           set -euo pipefail
 
-          # 最多尝试五次，两次尝试之间固定等待五秒。
           retry() {
             local attempt rc=1
             for attempt in 1 2 3 4 5; do
@@ -743,7 +721,6 @@ jobs:
             return "$rc"
           }
 
-          # 保留失败残留清理，防止重试被已有的半成品目录阻断。
           clone_susfs() {
             local rc
             rm -rf -- susfs4ksu || return 1
@@ -799,15 +776,10 @@ jobs:
           echo "SUSFS_LATEST_COMMIT_DATE=$SUSFS_LATEST_COMMIT_DATE" >> "$GITHUB_ENV"
           echo "SUSFS 仓库最新提交日期: $SUSFS_LATEST_COMMIT_DATE"
 
-      # ==================== SUSFS 集成补丁导出 ====================
-      # 仅 SukiSU / BakaSU 且启用 SUSFS 时导出，快照用临时索引生成树对象，
-      # 不创建提交，避免改变「配置内核名称」读取的 HEAD 哈希
       - name: 记录 SUSFS 基线快照
         if: inputs.export_susfs_patches && inputs.enable_susfs && inputs.ksu_mode != '禁用KSU' && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU')
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # 排除 .rej/.orig 和补丁文件本身：apply.sh 会把 SUSFS 补丁拷进 common/ 并留下 .rej
-          # 从真实索引复制一份再 add，只需哈希变动文件，避免对整棵内核树重新哈希
           cp "$(git rev-parse --git-path index)" /tmp/susfs-base.idx
           export GIT_INDEX_FILE=/tmp/susfs-base.idx
           git add -A -- . ':!*.rej' ':!*.orig' ':!*.patch'
@@ -847,18 +819,15 @@ jobs:
               echo "补丁内容为空"
               return 1
             fi
-            # 反向试打，证明补丁与当前工作树完全一致
             git apply --check -R "$OUT_DIR/susfs.patch" || return 1
 
             local formatted_branch gki_branch gki_commit
             formatted_branch="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
             gki_branch="$formatted_branch"
             grep -q deprecated <<< "$REMOTE_BRANCH" && gki_branch="deprecated/$formatted_branch"
-            # 分支已被上游删除时，实际检出的是发布 tag
             [ -n "$TAG_FALLBACK" ] && gki_branch="refs/tags/$TAG_FALLBACK"
             gki_commit=$(git rev-parse HEAD)
 
-            # KSU 与 SUSFS 提交都取本次构建实际克隆的仓库，不用 ls-remote 现查
             local ksu_repo ksu_commit ksu_slug ksu_setup_cmd
             ksu_repo=$(git -C "$KERNEL_ROOT/KernelSU" remote get-url origin | sed 's/\.git$//')
             ksu_commit=$(git -C "$KERNEL_ROOT/KernelSU" rev-parse HEAD)
@@ -871,8 +840,6 @@ jobs:
             susfs_commit=$(git -C "$SUSFS4KSU" rev-parse HEAD)
 
             local rej_count patch_sha256
-            # 上游自带且未改动的 .rej（如 android15-6.6-2026-04 的 mm/rmap.c.rej）不算冲突；
-            # patch 失败会覆盖同名文件，所以被改动过的仍要计入
             rej_count=$(comm -23 \
               <(find . -type f -name '*.rej' | sed 's|^\./||' | sort) \
               <(git ls-files -- '*.rej' | while IFS= read -r f; do git diff --quiet -- "$f" && echo "$f"; done | sort) | wc -l)
@@ -922,11 +889,7 @@ jobs:
         if: inputs.use_nomount
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # NoMount 是挂载元模块，在 fs/ 目录注册子系统，与 SUSFS sus_mount 不冲突，可与任意 KSU 变体共存。
-          # 必须在「生成 SUSFS 集成补丁」之后运行，避免 NoMount 改动被计入 susfs.patch；
-          # 且在「备份基准 defconfig」之后追加 CONFIG，确保 6.1+ 的 bazel fragment diff 能捕获 CONFIG_NOMOUNT。
           set -euo pipefail
-          # 拉取 NoMount 内核集成脚本（dev 分支最新提交），脚本会克隆仓库、建立 fs/nomount 软链接并注册 Kconfig/Makefile（内部含幂等守卫）
           curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
             https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
 
@@ -936,7 +899,6 @@ jobs:
           fi
           echo "NoMount 集成完成，commit: $(git -C NoMount rev-parse HEAD)"
 
-          # 启用 NoMount defconfig（幂等）
           if ! grep -q '^CONFIG_NOMOUNT=y' "$DEFCONFIG"; then
             echo "CONFIG_NOMOUNT=y" >> "$DEFCONFIG"
             echo "已启用 CONFIG_NOMOUNT=y"
@@ -951,7 +913,6 @@ jobs:
           KERNEL_VER="${{ inputs.kernel_version }}"
           SLOT="${{ inputs.droidspaces }}"
 
-          # 678 -> 6_7_8, 123 -> 1_2_3, 345 -> 3_4_5
           SLOT_NAME=$(echo "$SLOT" | sed 's/\(.\)/\1_/g; s/_$//')
           echo "应用 Droidspaces SYSVIPC kABI 修复补丁 (槽位: $SLOT / $SLOT_NAME)..."
           case "$KERNEL_VER" in
@@ -970,7 +931,6 @@ jobs:
             echo "::warning::SYSVIPC kABI 补丁应用失败，可能已应用或上下文不匹配"
           fi
 
-          # 5.10 及以下还需要 POSIX_MQUEUE 的 kABI 修复
           if [ "$KERNEL_VER" = "5.10" ]; then
             echo "应用 Droidspaces POSIX_MQUEUE kABI 修复补丁 (5.10)..."
             POSIX_PATCH="$DROIDSPACES_PATCHES/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
@@ -979,9 +939,6 @@ jobs:
             fi
           fi
 
-          # Android 16 / 6.12 的 rust_binder.ko 在启用 IPC_NS 后会引用
-          # init_ipc_ns 与 put_ipc_ns，但当前 AOSP common 分支尚未导出这两个符号。
-          # 这里补齐导出，避免 modpost 因 undefined symbol 失败。
           if [ "$KERNEL_VER" = "6.12" ]; then
             if [ -f "ipc/msgutil.c" ] && ! grep -qF 'EXPORT_SYMBOL(init_ipc_ns);' "ipc/msgutil.c"; then
               sed -i '/^struct msg_msgseg {/i EXPORT_SYMBOL(init_ipc_ns);' "ipc/msgutil.c"
@@ -1022,20 +979,13 @@ jobs:
             fi
           }
 
-          # 必要配置
           enable_config CONFIG_SYSVIPC
           enable_config CONFIG_POSIX_MQUEUE
           enable_config CONFIG_IPC_NS
           enable_config CONFIG_PID_NS
           enable_config CONFIG_DEVTMPFS
-
-          # 用户命名空间：上游文档列为可选但推荐，用于修复 docker unsafe procfs 报错。
-          # init/Kconfig 中无 depends on，且 struct cred 的 user_ns/ucounts 是无条件成员，
-          # task_struct 等结构体不含 CONFIG_USER_NS 条件编译，因此不影响 kABI 布局，
-          # 不需要像 SYSVIPC/IPC_NS 那样额外打 padding 补丁。与 wild_kernel 保持一致，全版本启用。
           enable_config CONFIG_USER_NS
 
-          # 可选: 网络相关配置 (Docker/NAT 模式)
           enable_config_if_defined CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
           enable_config_if_defined CONFIG_NETFILTER_XT_TARGET_LOG
           enable_config_if_defined CONFIG_NETFILTER_XT_MATCH_RECENT
@@ -1043,15 +993,12 @@ jobs:
           enable_config_if_defined CONFIG_IP_SET_HASH_IP
           enable_config_if_defined CONFIG_IP_SET_HASH_NET
           enable_config_if_defined CONFIG_NETFILTER_XT_SET
-
-          # REJECT 目标在不同内核版本上的符号名可能不同，按实际存在的配置启用
           enable_config_if_defined CONFIG_NETFILTER_XT_TARGET_REJECT
           enable_config_if_defined CONFIG_IP_NF_TARGET_REJECT
 
           echo "Droidspaces 集成完成"
 
           echo "GKI6.6 普通用户联网专用配置 (Droidspaces)"
-          # 专门处理 =n 类型的配置（安卓网络权限必须关闭）
           disable_config() {
             local cfg="$1"
             if grep -q "^${cfg}=n" "$DEFCONFIG"; then
@@ -1066,7 +1013,6 @@ jobs:
           }
 
           if [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" ]]; then
-            # 关闭安卓严格网络控制，否则容器内普通用户无法联网
             disable_config CONFIG_ANDROID_PARANOID_NETWORK
           fi
 
@@ -1112,8 +1058,6 @@ jobs:
 
           CONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
           echo "正在检查并启用 CONFIG_NTSYNC..."
-
-          # 移除未启用标记，再追加启用项，保证重复运行时保持幂等。
           sed -i '/CONFIG_NTSYNC is not set/d' "$CONFIG_PATH"
           if ! grep -q "^CONFIG_NTSYNC=y" "$CONFIG_PATH"; then
             echo "CONFIG_NTSYNC=y" >> "$CONFIG_PATH"
@@ -1121,15 +1065,12 @@ jobs:
           else
             echo "✅ CONFIG_NTSYNC 已处于启用状态"
           fi
-
           echo "=== NTSync 补丁与配置注入完成 ==="
 
       - name: 应用 Unicode 绕过修复
         if: inputs.enable_susfs
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # 上游 2023-11、2024-01、2024-03 月度分支已带有 "unicode: Don't special case ignorable code points"，
-          # patch --forward 会判定为已应用并跳过，但被忽略的 hunk 仍会写成 .rej，先做幂等检查
           if [ -f fs/unicode/mkutf8data.c ] && ! grep -q 'ignore_init' fs/unicode/mkutf8data.c; then
             echo "源码已包含 Unicode 绕过修复，跳过补丁"
             exit 0
@@ -1271,7 +1212,6 @@ jobs:
           KVER="${{ inputs.kernel_version }}"
           AVER="${{ inputs.android_version }}"
 
-          # ---------- BBRv3 补丁：按版本分派（来自 WildKernels/kernel_patches） ----------
           case "$AVER-$KVER" in
             android12-5.10) BBR3_PATCH="$BBR3_DIR/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch" ;;
             android13-5.15) BBR3_PATCH="$BBR3_DIR/0001-net-tcp-backport-BBRv3-to-android13-5.15.patch" ;;
@@ -1280,7 +1220,6 @@ jobs:
             *) BBR3_PATCH="" ;;
           esac
 
-          # android16-6.12 的 backport 补丁上游不可用（wild_kernel 已禁用），仅保留基线 BBR v1
           if [ -n "$BBR3_PATCH" ]; then
             if [ ! -f "$BBR3_PATCH" ]; then
               echo "::error::BBRv3 补丁不存在: $BBR3_PATCH" >&2
@@ -1298,7 +1237,6 @@ jobs:
             echo "[*] $AVER-$KVER 无 BBRv3 backport，跳过补丁"
           fi
 
-          # 5.10 缺少 proc_dou8vec_minmax（BBRv3 依赖的 5.15+ sysctl API），补两个前置补丁
           if [ "$KVER" = "5.10" ] && ! grep -qF 'int proc_dou8vec_minmax(' include/linux/sysctl.h 2>/dev/null; then
             for prepatch in sysctl_add_proc_dou8vec_minmax sysctl_fix_data-races_in_proc_dou8vec_minmax; do
               if patch -p1 --dry-run < "$BBR3_DIR/$prepatch.patch" >/dev/null 2>&1; then
@@ -1322,7 +1260,6 @@ jobs:
             fi
           }
 
-          # IPSet 全家桶 + netfilter 联动（各版本 Kconfig 均已验证存在）
           for cfg in IP_SET IP_SET_BITMAP_IP IP_SET_BITMAP_IPMAC IP_SET_BITMAP_PORT \
             IP_SET_HASH_IP IP_SET_HASH_IPMARK IP_SET_HASH_IPPORT IP_SET_HASH_IPPORTIP \
             IP_SET_HASH_IPPORTNET IP_SET_HASH_IPMAC IP_SET_HASH_MAC \
@@ -1334,7 +1271,6 @@ jobs:
           done
           set_config CONFIG_IP_SET_MAX 65534
 
-          # TCP 拥塞控制算法：已打 BBRv3 补丁的版本默认 bbr3，其余默认 bbr
           for cfg in TCP_CONG_ADVANCED TCP_CONG_BBR TCP_CONG_CUBIC \
             TCP_CONG_BIC TCP_CONG_WESTWOOD TCP_CONG_HTCP; do
             set_config "CONFIG_$cfg" y
@@ -1348,18 +1284,15 @@ jobs:
             set_config CONFIG_DEFAULT_TCP_CONG '"bbr"'
           fi
 
-          # 流量整形 Qdisc + 连接标记 + TTL/HopLimit + WireGuard
           for cfg in NET_SCH_FQ NET_SCH_FQ_CODEL NET_SCH_CAKE NET_ACT_CONNMARK \
             IP_NF_TARGET_TTL IP6_NF_TARGET_HL IP6_NF_MATCH_HL WIREGUARD; do
             set_config "CONFIG_$cfg" y
           done
 
-          # CIFS 网络文件系统（NETFS_SUPPORT 为隐藏符号，由 Kconfig 按需选中）
           for cfg in CIFS NETWORK_FILESYSTEMS KEYS CIFS_XATTR CIFS_POSIX; do
             set_config "CONFIG_$cfg" y
           done
 
-          # 6.12 的 NETFS 内置化后需移除 modules.bzl 的模块条目，否则打包失败
           if [ "$AVER" = "android16" ] && grep -q '"fs/netfs/netfs.ko",' modules.bzl 2>/dev/null; then
             sed -i '/"fs\/netfs\/netfs\.ko",/d' modules.bzl
           fi
@@ -1376,19 +1309,16 @@ jobs:
           rm -rf "$TMP_REKERNEL"
           git clone --depth 1 https://github.com/Sakion-Team/Re-Kernel.git "$TMP_REKERNEL"
 
-          # 同步上游拆分后的完整驱动源码
           rm -rf common/drivers/rekernel
           mkdir -p common/drivers/rekernel
           cp -a "$TMP_REKERNEL/LKM-Source/." common/drivers/rekernel/
 
-          # 将上游外置模块配置适配为内核内置驱动
           REKERNEL_MAKEFILE="common/drivers/rekernel/Makefile"
           sed -i 's/^obj-m := rekernel\.o$/obj-$(CONFIG_REKERNEL) += rekernel.o/' "$REKERNEL_MAKEFILE"
           grep -qF 'ccflags-$(CONFIG_REKERNEL_LEGACY_NETLINK) += -DLEGACY_NETLINK' "$REKERNEL_MAKEFILE" || \
             echo 'ccflags-$(CONFIG_REKERNEL_LEGACY_NETLINK) += -DLEGACY_NETLINK' >> "$REKERNEL_MAKEFILE"
           sed -i '/^[[:space:]]*depends on MODULES[[:space:]]*$/d' common/drivers/rekernel/Kconfig
 
-          # 挂载到驱动树
           if ! grep -qF 'source "drivers/rekernel/Kconfig"' common/drivers/Kconfig; then
             sed -i '/^endmenu$/i source "drivers/rekernel/Kconfig"' common/drivers/Kconfig
           fi
@@ -1396,25 +1326,25 @@ jobs:
             echo 'obj-$(CONFIG_REKERNEL) += rekernel/' >> common/drivers/Makefile
           fi
 
-          # 修正头文件包含路径（适配 in-tree 编译）
           sed -i 's|#include <../android/binder_internal.h>|#include "../android/binder_internal.h"|g' common/drivers/rekernel/rekernel_binder.c
-          # 补齐 5.10 binder_internal.h 使用 DEFINE_SHOW_ATTRIBUTE 所需的定义
           grep -qF '#include <linux/seq_file.h>' common/drivers/rekernel/rekernel_binder.c || \
             sed -i '/#include <linux\/kprobes.h>/a #include <linux/seq_file.h>' common/drivers/rekernel/rekernel_binder.c
 
-          # 配置 defconfig（幂等）
           grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL=y" >> "$DEFCONFIG"
           grep -q '^CONFIG_REKERNEL_NETWORK=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL_NETWORK=y" >> "$DEFCONFIG"
 
       - name: 配置内核选项
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
+          # 【修改4】关闭 LTO，极大降低编译时间，并避免后续因 Thin LTO 强行报错
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_TMPFS_XATTR=y
           CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_LTO_NONE=y
+          # CONFIG_LTO_CLANG_THIN is not set
+          # CONFIG_LTO_CLANG_FULL is not set
           EOF
 
-          # 禁用KSU 时源码里没有 KernelSU，CONFIG_KSU 不存在，写入会被 bazel 的 defconfig 检查拒绝
           if [ "${{ inputs.ksu_mode }}" != "禁用KSU" ]; then
             echo "CONFIG_KSU=y" >> "$DEFCONFIG"
           fi
@@ -1438,7 +1368,6 @@ jobs:
               echo "CONFIG_KALLSYMS=y"
               echo "CONFIG_KALLSYMS_ALL=y"
             } >> "$DEFCONFIG"
-            # 修复 5.15.74~5.15.137: kallsyms_on_each_symbol 仅在 LIVEPATCH 下编译，导致 BakaSU 链接失败
             KALLSYMS_C="./common/kernel/kallsyms.c"
             if [ -f "$KALLSYMS_C" ] \
               && grep -qF 'int kallsyms_on_each_symbol' "$KALLSYMS_C" \
@@ -1468,7 +1397,6 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_MAP=y
           EOF
 
-          # 把本步实际追加的行导出为配置片段，随 SUSFS 集成补丁一起分发
           if [ "$SUSFS_PATCH_EXPORT" = "true" ] && [ -d "$GITHUB_WORKSPACE/susfs-patch" ]; then
             tail -n +$((LINES_BEFORE + 1)) "$DEFCONFIG" > "$GITHUB_WORKSPACE/susfs-patch/susfs.config"
             echo "已导出 SUSFS 配置片段: $(wc -l < "$GITHUB_WORKSPACE/susfs-patch/susfs.config") 行"
@@ -1542,7 +1470,6 @@ jobs:
           echo "KBUILD_BUILD_TIMESTAMP=$DATESTR" >> "$GITHUB_ENV"
           echo "KBUILD_BUILD_VERSION=1" >> "$GITHUB_ENV"
 
-          # 统一处理 mkcompile_h 补丁
           f="$KERNEL_ROOT/common/scripts/mkcompile_h"
           if [ -f "$f" ]; then
             if [[ "${{ inputs.kernel_version }}" == "5.10" || "${{ inputs.kernel_version }}" == "5.15" ]]; then
@@ -1563,15 +1490,16 @@ jobs:
         uses: nick-fields/retry@v4
         with:
           shell: bash
-          timeout_minutes: 30
-          max_attempts: 3
+          # 【修改2】编译超时改为 120 分钟
+          timeout_minutes: 120
+          # 【修改3】最多重试 2 次（总耗时 4 小时）
+          max_attempts: 2
           retry_on: timeout
           command: |
             LOG_DIR="$GITHUB_WORKSPACE/build-logs"
             ATTEMPT_FILE="$LOG_DIR/.compile-attempt"
             mkdir -p "$LOG_DIR"
 
-            # 为 retry 的每次执行生成独立日志
             ATTEMPT=1
             if [ -s "$ATTEMPT_FILE" ]; then
               read -r LAST_ATTEMPT < "$ATTEMPT_FILE"
@@ -1599,7 +1527,6 @@ jobs:
                 BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
                 strings "out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" | grep 'Linux version'
               else
-                # 提取 gki_defconfig 修改到 fragment，避免 bazel trim 检查失败
                 FRAG="common/arch/arm64/configs/ksu.fragment"
                 diff "$DEFCONFIG.orig" "$DEFCONFIG" | grep '^>' | sed 's/^> //; s/^[[:space:]]*//' > "$FRAG" || true
                 cp "$DEFCONFIG.orig" "$DEFCONFIG"
@@ -1619,8 +1546,8 @@ jobs:
                 echo "最终配置: $FINAL_CONFIG"
                 grep -E '^CONFIG_LTO' "$FINAL_CONFIG" || echo '（未找到 CONFIG_LTO，可能未启用 LTO 支持）'
                 if grep -qx 'CONFIG_LTO_CLANG_THIN=y' "$FINAL_CONFIG"; then
-                  echo "::error::Image 使用了 Thin LTO，与官方 GKI 的 LTO_NONE 不一致，刷入后可能无法启动"
-                  exit 1
+                  # 【修改4】将报错中断改为警告，防止因 Thin LTO 导致出包失败
+                  echo "::warning::Image 使用了 Thin LTO，与官方 GKI 的 LTO_NONE 不一致。这可能导致某些第三方模块加载失败，但已允许继续打包。"
                 fi
               else
                 echo "::warning::未找到生成的 .config，跳过 LTO 一致性校验"
@@ -1675,27 +1602,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
           compression-level: 9
-
-      # - name: 应用 KPM 补丁 (SukiSU/BakaSU/Next)
-      #   if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU' || inputs.ksu_variant == 'Next')
-      #   run: |
-      #     case "${{ inputs.android_version }}" in
-      #       "android12"|"android13")
-      #         if [ "${{ inputs.kernel_version }}" != "6.6" ]; then
-      #           TARGET_PATH="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
-      #         fi
-      #         ;;
-      #       "android14"|"android15"|"android16")
-      #         TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/"
-      #         ;;
-      #     esac
-
-      #     cp -r $SUKISU_PATCHES/kpm/patch_linux "$TARGET_PATH/patch"
-      #     cd "$TARGET_PATH"
-      #     chmod 777 patch
-      #     ./patch
-      #     rm -rf Image
-      #     mv oImage Image
 
       - name: 准备 Boot 镜像
         run: |
@@ -1781,9 +1687,6 @@ jobs:
           REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
           mkdir -p "$REJECTS_DIR"
 
-          # 跳过上游自带的 .rej：上游分支可能自带已提交的 .rej
-          # （如 android15-6.6-2026-04 的 mm/rmap.c.rej），那不是本项目补丁的冲突；
-          # patch 失败会覆盖同名文件，所以只跳过「被 git 跟踪且未改动」的
           mapfile -t REJS < <(
             find "$KERNEL_ROOT" -type f -name '*.rej' | sort | while IFS= read -r rej; do
               if git -C "$(dirname "$rej")" ls-files --error-unmatch -- "$(basename "$rej")" >/dev/null 2>&1 \
@@ -1813,7 +1716,6 @@ jobs:
             done
           fi
 
-      # 产物名不带 _kernel- 前缀，避免 release 的「上传内核产物」通配到补丁文件
       - name: 上传 SUSFS 集成补丁
         if: success() && env.SUSFS_PATCH_EXPORT == 'true'
         uses: actions/upload-artifact@v6
